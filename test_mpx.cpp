@@ -75,9 +75,18 @@ long random(long min, long max) {
   return min + (rand() % (max - min));
 }
 
-void run(std::vector<int> cursors) {
+void send_input_focus(Display* display, Window window) {
+  XEvent event;
+  event.type = FocusIn;
+  event.xfocus.display = display;
+  event.xfocus.window = window;
+  event.xfocus.mode = NotifyNormal;
+  event.xfocus.detail = NotifyNonlinear;
+  XSendEvent(display, window, True, FocusChangeMask, &event);
+}
+
+void run(std::vector<int> cursors, const std::vector<int>& windows) {
   Display* display = XOpenDisplay(NULL);
-  std::vector<int> windows = {0x4200003, 0x3a00003};
   const int W = 640;
   const int H = 320;
   Window root = XDefaultRootWindow(display);
@@ -85,50 +94,24 @@ void run(std::vector<int> cursors) {
     XISetClientPointer(display, None, cursors[i]);
     XISetClientPointer(display, windows[i], cursors[i]);
     XSync(display, 0);
-    // XTestFakeButtonEvent(display, 1, True, CurrentTime);
-    // XTestFakeButtonEvent(display, 1, False, CurrentTime);
     XSetInputFocus(display, windows[i], RevertToParent, CurrentTime);
+    send_input_focus(display, windows[i]);
+    XTestFakeButtonEvent(display, 1, True, CurrentTime);
+    XTestFakeButtonEvent(display, 1, False, CurrentTime);
     XSync(display, 0);
-
-    // XISetClientPointer(display, None, cursors[i]);
-    // XISetClientPointer(display, windows[i], cursors[i]);
-    // XSetInputFocus(display, windows[i], RevertToParent, CurrentTime);
-    // XFocusInEvent focus_in;
-    // focus_in.type = FocusIn;
-    // focus_in.display = display;
-    // focus_in.window = windows[i];
-    // focus_in.mode = NotifyNormal;
-    // focus_in.detail = NotifyNonlinear;
-    // XSendEvent(display, windows[i], False, 0, (XEvent*)&focus_in);
-    // XTestFakeButtonEvent(display, 1, True, CurrentTime);
-    // XFlush(display);
-    // usleep(50000);
-
-    // printf("Trying to open device %d\n", cursors[i]);
-    // devices.push_back(XOpenDevice(display, dids[i]));
   }
-  return;
 
   int n = 0;
   while (true) {
     n += 1;
     for (int i = 0; i < cursors.size(); ++i) {
-      // XISetClientPointer(display, None, cursors[i]);
-      // XISetClientPointer(display, root, cursors[i]);
-      // XISetClientPointer(display, windows[i], cursors[i]);
-      // XTestFakeButtonEvent(display, 1, True, CurrentTime);
-      // XTestFakeButtonEvent(display, 1, False, CurrentTime);
-      // XFlush(display);
-      // XSetInputFocus(display, windows[i], RevertToParent, CurrentTime);
-
-
       float theta = 2 * M_PI * n / 200.0;
       if (i % 2 == 0) {
         theta *= -1;
       }
 
       float x = W / 2 + W / 4 * cos(theta);
-      float y = H / 2 + H / 4 * sin(theta);
+      float y = 880 + H / 2 + H / 4 * sin(theta);
       x += 640 * i;
       int dir = theta / (2 * M_PI) * 8;
       dir = dir % 8;
@@ -136,24 +119,7 @@ void run(std::vector<int> cursors) {
         dir += 8;
       }
 
-      // XEnterWindowEvent enter;
-      // enter.type = EnterNotify;
-      // enter.display = display;
-      // enter.window = windows[i];
-      // enter.root = root;
-      // enter.subwindow = None;
-      // enter.time = CurrentTime;
-      // enter.x = x;
-      // enter.y = y;
-      // enter.x_root = x;
-      // enter.y_root = y;
-      // enter.mode = NotifyGrab;
-      // enter.detail = NotifyInferior;
-      // enter.same_screen = True;
-      // enter.focus = True;
-      // enter.state = 0;
-      // XSendEvent(display, windows[i], False, 0, (XEvent*)&enter);
-
+      XISetClientPointer(display, None, cursors[i]);
       XIWarpPointer(display, cursors[i], None, root, 0, 0, 0, 0, x, y);
       XDevice dev;
       dev.device_id = 0;
@@ -175,11 +141,7 @@ void run(std::vector<int> cursors) {
         event.state = 0;
         event.keycode = 38;
         event.same_screen = True;
-        // XSetInputFocus(display, windows[i], RevertToParent, CurrentTime);
-        // XSendEvent(display, windows[i], True, 0, (XEvent*)&event);
-        // XTestFakeMotionEvent(display, 0, x, y, CurrentTime);
         XTestFakeKeyEvent(display, 38, True, CurrentTime);
-        // XTestFakeDeviceKeyEvent(display, &dev, 38, True, 0, 0, CurrentTime);
         XFlush(display);
         printf("Window %d, press\n", i);
       } else {
@@ -197,11 +159,7 @@ void run(std::vector<int> cursors) {
         event.state = 0;
         event.keycode = 38;
         event.same_screen = True;
-        // XSetInputFocus(display, windows[i], RevertToParent, CurrentTime);
-        // XSendEvent(display, windows[i], True, 0, (XEvent*)&event);
-        // XTestFakeMotionEvent(display, 0, x, y, CurrentTime);
         XTestFakeKeyEvent(display, 38, False, CurrentTime);
-        // XTestFakeDeviceKeyEvent(display, &dev, 38, False, 0, 0, CurrentTime);
         XFlush(display);
         printf("Window %d, release\n", i);
       }
@@ -220,6 +178,18 @@ int main(int argc, char** argv) {
 
   clear_cursors();
   make_cursors(2);
-  run(get_cursors());
+
+  std::vector<int> windows;
+  for (int i = 1; i < argc; ++i) {
+    std::string arg = argv[i];
+    if (arg.substr(0, 2) == "0x") {
+      std::stringstream ss;
+      ss << std::hex << arg;
+      int window;
+      ss >> window;
+      windows.push_back(window);
+    }
+  }
+  run(get_cursors(), windows);
   return 0;
 }
