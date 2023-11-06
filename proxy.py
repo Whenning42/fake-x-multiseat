@@ -20,19 +20,26 @@ import select
 import atexit
 import struct
 import os
+from collections.abc import Iterable
 
 # Global first constructed XMessageStream. This is used by main to get the server
 # timestamp.
 first_stream = None
+
+CREATE_WINDOW = 1
+CHANGE_WINDOW_ATTRIBUTES = 2
 
 FOCUS_IN = 9
 FOCUS_OUT = 10
 LAST_STANDARD_EVENT = 34
 GENERIC_EVENT_CODE = 35
 
+OVERRIDE_REDIRECT = 0x00000200
+
 
 def pad(n):
     return n + (4 - (n % 4)) % 4
+
 
 class RequestParser:
     def __init__(self, socket: socket.socket, request_codes: dict):
@@ -43,52 +50,110 @@ class RequestParser:
         self.serial = 3
         self.request_codes = request_codes
 
+    def send(self, n: int):
+        self.socket.sendmsg([self.queued_bytes[:n]])
+        self.queued_bytes = self.queued_bytes[n:]
+
     def consume(self, data: bytes):
-        return
         global request_codes
         self.queued_bytes += data
 
         while True:
+            n = len(self.queued_bytes)
             if not self.is_connected:
-                n = len(self.queued_bytes)
                 if n < 12:
                     return
                 endianess, major, minor, n_0, n_1 = struct.unpack(
                     "BxHHHH", self.queued_bytes[:10]
                 )
                 is_little_endian = chr(endianess) == "l"
-                assert is_little_endian, "XProxy only supports little endian connections"
+                assert (
+                    is_little_endian
+                ), "XProxy only supports little endian connections"
 
                 n = 12 + pad(n_0) + pad(n_1)
                 if len(self.queued_bytes) < n:
                     return
                 self.serial += 1
-                self.queued_bytes = self.queued_bytes[n:]
+                self.send(n)
                 self.is_connected = True
+                continue
 
-            n = len(self.queued_bytes)
-            if n < 32:
+            if n < 4:
                 return
 
-            opcode, request_len, big_request_len = struct.unpack("BxHI", self.queued_bytes[:8])
+            opcode, request_len = struct.unpack("BxH", self.queued_bytes[:4])
+            # Big request protocol.
             if request_len == 0:
-                request_len = big_request_len
+                request_len = struct.unpack("I", self.queued_bytes[4:8])[0]
 
             request_bytes = 4 * request_len
-            print(f"Queue size: {len(self.queued_bytes)}, request bytes: {request_bytes}")
+            print(
+                f"Queue size: {len(self.queued_bytes)}, request bytes: {request_bytes}"
+            )
             if len(self.queued_bytes) < request_bytes:
                 self.fallback_n += 1
                 if self.fallback_n > 70:
                     self.queued_bytes = bytearray()
                     self.fallback_n = 0
-                print(f"Queuing, fallback {self.fallback_n}")
+                print(f"Queueing, fallback {self.fallback_n}")
                 return
+
+            # Force override redirect on CreateWindow calls.
+            if opcode == CREATE_WINDOW:
+                print("Overriding redirect on created window!")
+                # Add the override redirect attribute.
+                orig_mask = struct.unpack("I", self.queued_bytes[28:32])[0]
+                new_mask = orig_mask | OVERRIDE_REDIRECT
+                built_message = self.queued_bytes[0:32]
+                next_val = 0
+                for i in range(32):
+                    bit_mask = 1 << i
+                    if new_mask & bit_mask:
+                        print("Found mask: ", bit_mask)
+                        if bit_mask != OVERRIDE_REDIRECT:
+                            built_message += self.queued_bytes[
+                                32 + 4 * next_val : 32 + 4 * (next_val + 1)
+                            ]
+                            next_val += 1
+                        else:
+                            # Should this be Bxxx or I? Given that this
+                            # is little endian, it shouldn't matter.
+                            built_message += struct.pack("Bxxx", 1)
+                            if orig_mask & OVERRIDE_REDIRECT:
+                                next_val += 1
+                orig_request_bytes = request_bytes
+                request_bytes = len(built_message)
+                built_message[2:4] = struct.pack("H", request_bytes // 4)
+                built_message[28:32] = struct.pack("I", new_mask)
+                self.queued_bytes = (
+                    built_message + self.queued_bytes[orig_request_bytes:]
+                )
+                # print("Orig mask:", orig_mask)
+                # print("New mask:", new_mask)
+                # print("Request len:", request_bytes)
+                # print("New request:", self.queued_bytes[:request_bytes])
+            if opcode == CHANGE_WINDOW_ATTRIBUTES:
+                # Add the override redirect attribute.
+                update_mask = struct.unpack("I", self.queued_bytes[8:12])[0]
+                print(f"Change window attributes, update_mask: {update_mask}, and result: {update_mask & OVERRIDE_REDIRECT}")
+                if update_mask & OVERRIDE_REDIRECT:
+                    print("Overriding redirect on changed window!")
+                    val_i = 0
+                    for i in range(32):
+                        bit_mask = 1 << i
+                        if bit_mask & update_mask:
+                            if bit_mask == OVERRIDE_REDIRECT:
+                                self.queued_bytes[
+                                    12 + 4 * val_i : 12 + 4 * (val_i + 1)
+                                ] = struct.pack("I", 1)
+                            val_i += 1
 
             print(f"Requested opcode: {opcode}, serial: {self.serial}?")
             assert request_bytes > 0, "Reached invalidate state"
             self.request_codes[self.serial] = opcode
             self.serial = (self.serial + 1) % 2**16
-            self.queued_bytes = self.queued_bytes[request_bytes:]
+            self.send(request_bytes)
 
 
 class EventReplyParser:
@@ -193,14 +258,14 @@ class EventReplyParser:
             is_error = code == 0
             if is_reply:
                 opcode = self.request_codes.get(sequence_num, -1)
-                print(
-                    "Reply. Sequence num:",
-                    sequence_num,
-                    "Additional length:",
-                    reply_length,
-                    "Request code:",
-                    opcode,
-                )
+                # print(
+                #     "Reply. Sequence num:",
+                #     sequence_num,
+                #     "Additional length:",
+                #     reply_length,
+                #     "Request code:",
+                #     opcode,
+                # )
                 if opcode == 38:
                     # 1     1                               Reply
                     # 1     BOOL                            same-screen
@@ -216,13 +281,16 @@ class EventReplyParser:
                     # 2     SETofKEYBUTMASK                 mask
                     # 6                                     unused
                     rx, ry, wx, wy = struct.unpack(
-                        "HHHH", self.byte_buffer[self.message_end + 16 : self.message_end + 24]
+                        "HHHH",
+                        self.byte_buffer[self.message_end + 16 : self.message_end + 24],
                     )
-                    print("Cursor position:", rx, ry)
+                    # print("Cursor position:", rx, ry)
                     # Write a new cursor position.
-                    self.byte_buffer[self.message_end + 16 : self.message_end + 24] = struct.pack("HHHH", 1000, 600, 1000, 600)
+                    self.byte_buffer[
+                        self.message_end + 16 : self.message_end + 24
+                    ] = struct.pack("HHHH", 1000, 600, 1000, 600)
             if is_event:
-                print("Event with code:", code)
+                # print("Event with code:", code)
                 # Unset the send_event bit on all events.
                 self.byte_buffer[0] = self.byte_buffer[0] & 0x7F
 
@@ -244,7 +312,7 @@ class EventReplyParser:
                 should_filter = self.should_filter_event(code)
 
                 if code <= LAST_STANDARD_EVENT and should_filter:
-                    print("Filtering an event. Code", code, flush=True)
+                    # print("Filtering an event. Code", code, flush=True)
                     self.discard_bytes(32)
                     continue
                 elif code > LAST_STANDARD_EVENT and should_filter:
@@ -333,11 +401,24 @@ class XClientToServerStream:
         self.connection_bytes = bytes()
         self.parser = RequestParser(socket, request_codes)
 
-    def consume(self, data):
+    def consume(self, data: bytes):
         self.parser.consume(data)
+        if len(self.parser.queued_bytes) > 0:
+            print("Queued bytes:", len(self.parser.queued_bytes))
 
-    def sendmsg(self, buffers, anc_data):
-        self.socket.sendmsg(buffers, anc_data)
+    def sendmsg(self, buffers: Iterable[bytes], anc_data: Iterable[bytes]):
+        # TODO: Allow messages with ancillary data to be processed as well.
+        # To get this right, we need to send ancillary data at the correct point in the
+        # stream. This post describes where in the stream that should be:
+        # https://unix.stackexchange.com/questions/185011/what-happens-with-unix-stream-ancillary-data-on-partial-reads
+        #
+        # For now, we just punt on processing messages that include ancillary data.
+        print("Anc data:", anc_data)
+        if len(anc_data) > 0:
+            print(f"Processing anc_data, data len: {sum([len(b) for b in buffers])}")
+            self.socket.sendmsg(buffers, anc_data)
+            return
+
         for data in buffers:
             self.consume(data)
 
@@ -353,7 +434,7 @@ def _display_path(display_num):
 
 
 class Proxy:
-    def __init__(self, client_display_num=1, server_display_num=0):
+    def __init__(self, client_display_num=1, server_display_num=9):
         self.client_display = client_display_num
         self.server_display = server_display_num
 
