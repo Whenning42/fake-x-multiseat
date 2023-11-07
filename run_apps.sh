@@ -3,9 +3,11 @@
 
 WORKING_DIR=$(pwd)
 
-DISPLAY_A=:0
+python proxy.py &
+
+DISPLAY_A=:1
 WINEPREFIX_A="$HOME/.wine"
-DISPLAY_B=:0
+DISPLAY_B=:1
 WINEPREFIX_B="$HOME/.wine_2"
 
 cd ~/.steam/steam/steamapps/common/Noita/
