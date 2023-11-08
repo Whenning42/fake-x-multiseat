@@ -15,11 +15,11 @@
 #
 # TODO: Profile this against ArtOfRally to see if overhead is non-negligible.
 
-import socket
-import select
 import atexit
-import struct
 import os
+import select
+import socket
+import struct
 from collections.abc import Iterable
 
 # Global first constructed XMessageStream. This is used by main to get the server
