@@ -23,6 +23,8 @@ import socket
 import struct
 from collections.abc import Iterable
 
+logging.basicConfig(level=logging.INFO)
+
 # Global first constructed XMessageStream. This is used by main to get the server
 # timestamp.
 first_stream = None
@@ -89,7 +91,7 @@ class RequestParser:
                 request_len = struct.unpack("I", self.queued_bytes[4:8])[0]
 
             request_bytes = 4 * request_len
-            print(
+            logging.debug(
                 f"Queue size: {len(self.queued_bytes)}, request bytes: {request_bytes}"
             )
             if len(self.queued_bytes) < request_bytes:
@@ -97,12 +99,14 @@ class RequestParser:
                 if self.fallback_n > 70:
                     self.queued_bytes = bytearray()
                     self.fallback_n = 0
-                print(f"Queueing, fallback {self.fallback_n}")
+                logging.warning(
+                    f"Request parsing hit error heuristic. Fallback val: {self.fallback_n}"
+                )
                 return
 
             # Force override redirect on CreateWindow calls.
             if opcode == CREATE_WINDOW:
-                print("Overriding redirect on created window!")
+                logging.debug("Overriding redirect on created window!")
                 # Add the override redirect attribute.
                 orig_mask = struct.unpack("I", self.queued_bytes[28:32])[0]
                 new_mask = orig_mask | OVERRIDE_REDIRECT
@@ -111,7 +115,6 @@ class RequestParser:
                 for i in range(32):
                     bit_mask = 1 << i
                     if new_mask & bit_mask:
-                        print("Found mask: ", bit_mask)
                         if bit_mask != OVERRIDE_REDIRECT:
                             built_message += self.queued_bytes[
                                 32 + 4 * next_val : 32 + 4 * (next_val + 1)
@@ -130,16 +133,14 @@ class RequestParser:
                 self.queued_bytes = (
                     built_message + self.queued_bytes[orig_request_bytes:]
                 )
-                # print("Orig mask:", orig_mask)
-                # print("New mask:", new_mask)
-                # print("Request len:", request_bytes)
-                # print("New request:", self.queued_bytes[:request_bytes])
             if opcode == CHANGE_WINDOW_ATTRIBUTES:
                 # Add the override redirect attribute.
                 update_mask = struct.unpack("I", self.queued_bytes[8:12])[0]
-                print(f"Change window attributes, update_mask: {update_mask}, and result: {update_mask & OVERRIDE_REDIRECT}")
+                logging.debug(
+                    f"Change window attributes, update_mask: {update_mask}, and result: {update_mask & OVERRIDE_REDIRECT}"
+                )
                 if update_mask & OVERRIDE_REDIRECT:
-                    print("Overriding redirect on changed window!")
+                    logging.debug("Overriding redirect on changed window!")
                     val_i = 0
                     for i in range(32):
                         bit_mask = 1 << i
@@ -150,7 +151,7 @@ class RequestParser:
                                 ] = struct.pack("I", 1)
                             val_i += 1
 
-            print(f"Requested opcode: {opcode}, serial: {self.serial}?")
+            logging.debug(f"Requested opcode: {opcode}, serial: {self.serial}?")
             assert request_bytes > 0, "Reached invalidate state"
             self.request_codes[self.serial] = opcode
             self.serial = (self.serial + 1) % 2**16
@@ -218,7 +219,6 @@ class EventReplyParser:
         self.anc_data = anc_data
 
     def consume(self, data):
-        # print("Consume")
         if self.bytes_to_discard > 0:
             before = len(data)
             data = data[self.bytes_to_discard :]
@@ -232,7 +232,7 @@ class EventReplyParser:
         if self.connecting:
             if n < 8:
                 return
-            print(
+            logging.debug(
                 "Consuming client received connection setup of",
                 len(self.byte_buffer),
                 "bytes",
@@ -243,14 +243,12 @@ class EventReplyParser:
             assert code == 1, "Client received unexpected connection code " + str(code)
             total_len = 8 + additional_data_len * 4
             if n >= total_len:
-                print("Client finished setup")
+                logging.info("Client finished setup")
                 self.commit_message(total_len)
                 self.connecting = False
             return
 
         while len(self.byte_buffer) - self.message_end >= 32:
-            # print("Buffer len: ", len(self.byte_buffer))
-            # print("Read offset: ", self.message_end)
             code, sequence_num, reply_length = struct.unpack(
                 "BxHI", self.byte_buffer[self.message_end : self.message_end + 8]
             )
@@ -259,28 +257,7 @@ class EventReplyParser:
             is_error = code == 0
             if is_reply:
                 opcode = self.request_codes.get(sequence_num, -1)
-                # print(
-                #     "Reply. Sequence num:",
-                #     sequence_num,
-                #     "Additional length:",
-                #     reply_length,
-                #     "Request code:",
-                #     opcode,
-                # )
                 if opcode == 38:
-                    # 1     1                               Reply
-                    # 1     BOOL                            same-screen
-                    # 2     CARD16                          sequence number
-                    # 4     0                               reply length
-                    # 4     WINDOW                          root
-                    # 4     WINDOW                          child
-                    #      0     None
-                    # 2     INT16                           root-x
-                    # 2     INT16                           root-y
-                    # 2     INT16                           win-x
-                    # 2     INT16                           win-y
-                    # 2     SETofKEYBUTMASK                 mask
-                    # 6                                     unused
                     rx, ry, wx, wy = struct.unpack(
                         "HHHH",
                         self.byte_buffer[self.message_end + 16 : self.message_end + 24],
@@ -291,7 +268,6 @@ class EventReplyParser:
                         self.message_end + 16 : self.message_end + 24
                     ] = struct.pack("HHHH", 1000, 600, 1000, 600)
             if is_event:
-                # print("Event with code:", code)
                 # Unset the send_event bit on all events.
                 self.byte_buffer[0] = self.byte_buffer[0] & 0x7F
 
@@ -313,11 +289,11 @@ class EventReplyParser:
                 should_filter = self.should_filter_event(code)
 
                 if code <= LAST_STANDARD_EVENT and should_filter:
-                    # print("Filtering an event. Code", code, flush=True)
+                    logging.info("Filtering an event. Code", code, flush=True)
                     self.discard_bytes(32)
                     continue
                 elif code > LAST_STANDARD_EVENT and should_filter:
-                    print("UnimplementedError", flush=True)
+                    logging.error("UnimplementedError", flush=True)
                     raise NotImplementedError
 
                 if code == FOCUS_IN:
@@ -339,7 +315,7 @@ class EventReplyParser:
                 code = struct.unpack(
                     "xB", self.byte_buffer[self.message_end : self.message_end + 2]
                 )
-                print("Error:", code)
+                logging.info("X11 Error:", code)
                 self.commit_message(32)
                 continue
             if is_reply:
@@ -356,7 +332,7 @@ class EventReplyParser:
             sent = self.socket.sendmsg([data], self.anc_data)
             self.sent_end += sent
             assert sent == len(data)
-            print("Wrote: ", sent)
+            logging.debug("Wrote: ", sent)
 
         # Remove all fully processed messages from the byte_buffer.
         self.byte_buffer = self.byte_buffer[self.message_end :]
@@ -383,7 +359,9 @@ class XServerToClientStream:
 
         unflushed_len = len(self.byte_stream.byte_buffer)
         if unflushed_len > 0:
-            print("Unflushed:", unflushed_len, "on socket:", self.byte_stream.socket)
+            logging.info(
+                f"Unflushed: {unflushed_len} on socket: {self.byte_stream.socket}"
+            )
 
     def process(self, message):
         # TODO: Implement filtering.
@@ -405,7 +383,7 @@ class XClientToServerStream:
     def consume(self, data: bytes):
         self.parser.consume(data)
         if len(self.parser.queued_bytes) > 0:
-            print("Queued bytes:", len(self.parser.queued_bytes))
+            logging.info("Queued bytes:", len(self.parser.queued_bytes))
 
     def sendmsg(self, buffers: Iterable[bytes], anc_data: Iterable[bytes]):
         # TODO: Allow messages with ancillary data to be processed as well.
@@ -414,9 +392,10 @@ class XClientToServerStream:
         # https://unix.stackexchange.com/questions/185011/what-happens-with-unix-stream-ancillary-data-on-partial-reads
         #
         # For now, we just punt on processing messages that include ancillary data.
-        print("Anc data:", anc_data)
         if len(anc_data) > 0:
-            print(f"Processing anc_data, data len: {sum([len(b) for b in buffers])}")
+            logging.debug(
+                f"Processing anc_data, data len: {sum([len(b) for b in buffers])}"
+            )
             self.socket.sendmsg(buffers, anc_data)
             return
 
@@ -435,7 +414,7 @@ def _display_path(display_num):
 
 
 class Proxy:
-    def __init__(self, client_display_num=1, server_display_num=9):
+    def __init__(self, client_display_num=1, server_display_num=0):
         self.client_display = client_display_num
         self.server_display = server_display_num
 
@@ -451,21 +430,16 @@ class Proxy:
         self.sockets = [self.client_socket]
         self.mirrors = {}
 
-        self.i = 0
         self.max_p = 0
 
     def run(self):
         global first_stream
         while True:
-            # print("select")
-            # print("desc:", [s.fileno() for s in self.sockets])
-            # print("selecting")
             read, _, _ = select.select(self.sockets, [], [])
-            # print("read:", [s.fileno() for s in read])
             for rs in read:
                 if rs is self.client_socket:
                     # Create sockets for the client connection and display connection.
-                    print("Client connected")
+                    logging.info("Client connected")
                     client_connection, address = rs.accept()
                     display_connection = socket.socket(
                         socket.AF_UNIX, socket.SOCK_STREAM
@@ -491,10 +465,6 @@ class Proxy:
                     self.display_connections.add(display_connection)
                     break
                 else:
-                    self.i += 1
-                    if self.i % 100000 == 0:
-                        print("Proxyied:", self.i)
-
                     mirror_socket = self.mirrors.get(rs, None)
                     if mirror_socket is None:
                         assert False, "No mirror"
@@ -544,7 +514,7 @@ class Proxy:
         for client_connection in self.client_connections:
             try:
                 client_connection.send(message)
-                print("Injected message")
+                logging.info("Injected message")
             except BrokenPipeError:
                 # print("Failed to inject message")
                 pass
