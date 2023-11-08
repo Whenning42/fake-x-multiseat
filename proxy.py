@@ -16,6 +16,7 @@
 # TODO: Profile this against ArtOfRally to see if overhead is non-negligible.
 
 import atexit
+import logging
 import os
 import select
 import socket
@@ -498,40 +499,46 @@ class Proxy:
                     if mirror_socket is None:
                         assert False, "No mirror"
 
-                    recv_data, anc_data, flags, _ = rs.recvmsg(int(5e5), int(1e4))
+                    try:
+                        recv_data, anc_data, flags, _ = rs.recvmsg(int(5e5), int(1e4))
+                    except ConnectionResetError:
+                        logging.info("ConnectionReset cleanup")
+                        self.cleanup_from_client(mirror_socket, rs)
+                        break
+
                     assert (flags & socket.MSG_TRUNC == 0) and (
                         flags & socket.MSG_CTRUNC == 0
                     )
 
                     n = len(recv_data)
                     if n > self.max_p:
-                        # print("New max payload: ", l)
                         self.max_p = n
 
                     if len(recv_data) == 0:
-                        # print("Client connection closed")
-                        mirror_socket.close()
-                        self.sockets.remove(rs)
-                        self.sockets.remove(mirror_socket.get_socket())
-                        self.mirrors.pop(rs, None)
-                        self.mirrors.pop(mirror_socket, None)
+                        logging.info("Connection closed cleanup")
+                        self.cleanup_from_client(mirror_socket, rs)
                         break
 
                     try:
                         mirror_socket.sendmsg([recv_data], anc_data)
-                        # Our stream wrappers don't implement returning sent bytes.
-                        # assert sent == len(recv_data)
                     except BrokenPipeError:
-                        print("Client connection broken")
-
-                        # Since mirror_socket.send failed, we know it was closed and is
-                        # thus the client socket.
-                        rs.close()
-                        self.sockets.remove(rs)
-                        self.sockets.remove(mirror_socket.get_socket())
-                        self.mirrors.pop(rs, None)
-                        self.mirrors.pop(mirror_socket, None)
+                        logging.info("Client connection broken")
+                        self.cleanup_from_server(mirror_socket, rs)
                         break
+
+    def cleanup_from_client(self, mirror_socket, rs):
+        mirror_socket.close()
+        self.sockets.remove(rs)
+        self.sockets.remove(mirror_socket.get_socket())
+        self.mirrors.pop(rs, None)
+        self.mirrors.pop(mirror_socket, None)
+
+    def cleanup_from_server(self, mirror_socket, rs):
+        rs.close()
+        self.sockets.remove(rs)
+        self.sockets.remove(mirror_socket.get_socket())
+        self.mirrors.pop(rs, None)
+        self.mirrors.pop(mirror_socket, None)
 
     def inject(self, message):
         for client_connection in self.client_connections:
